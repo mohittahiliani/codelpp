@@ -1,0 +1,182 @@
+diff --git a/src/traffic-control/model/codel-queue-disc.cc b/src/traffic-control/model/codel-queue-disc.cc
+index 7a1b3839c..6062d168b 100644
+--- a/src/traffic-control/model/codel-queue-disc.cc
++++ b/src/traffic-control/model/codel-queue-disc.cc
+@@ -72,6 +72,11 @@ CoDelQueueDisc::GetTypeId()
+                           BooleanValue(false),
+                           MakeBooleanAccessor(&CoDelQueueDisc::m_useEcn),
+                           MakeBooleanChecker())
++            .AddAttribute("UsePp",
++                          "True to use pp (Enables CoDel++)",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&CoDelQueueDisc::m_usePp),
++                          MakeBooleanChecker())
+             .AddAttribute("UseL4s",
+                           "True to use L4S (only ECT1 packets are marked at CE threshold)",
+                           BooleanValue(false),
+@@ -153,11 +158,35 @@ CoDelQueueDisc::NewtonStep(uint16_t recInvSqrt, uint32_t count)
+     return static_cast<uint16_t>(val >> REC_INV_SQRT_SHIFT);
+ }
+ 
++uint16_t
++CoDelQueueDisc::NewtonStepPp(uint16_t recInvSqrt, uint32_t count)
++{
++    NS_LOG_FUNCTION_NOARGS();
++    uint32_t invsqrt = ((uint32_t)recInvSqrt) << REC_INV_SQRT_SHIFT;
++    // Compute invsqrt^2
++    uint32_t invsqrt2 = ((uint64_t)invsqrt * invsqrt) >> 32;
++    uint32_t invsqrt4 = ((uint64_t)invsqrt2 * invsqrt2) >> 32;
++    // Compute the correction factor: (5 - invsqrt^4 * count) / 4
++    uint64_t correction =
++        (5LL << 32) - ((uint64_t)invsqrt4 * count); /* Fixed-point scaling for 5 */
++    correction >>= 3;                               /* avoid overflow */
++    /*Apply the formula: xn+1 = xn * correction */
++    uint32_t val = (correction * invsqrt) >> (32 - 3 + 2);
++    return static_cast<uint16_t>(val >> REC_INV_SQRT_SHIFT);
++}
++
+ uint32_t
+-CoDelQueueDisc::ControlLaw(uint32_t t, uint32_t interval, uint32_t recInvSqrt)
++CoDelQueueDisc::ControlLaw(uint32_t t, uint32_t interval, uint32_t recInvSqrt, bool usePp)
+ {
+     NS_LOG_FUNCTION_NOARGS();
+-    return t + ReciprocalDivide(interval, recInvSqrt << REC_INV_SQRT_SHIFT);
++    uint32_t m_InvSqrtShifted = recInvSqrt << REC_INV_SQRT_SHIFT;
++    if (usePp)
++    {
++        uint32_t m_recInvSqrt2 = (uint64_t(m_InvSqrtShifted) * m_InvSqrtShifted) >> 32;
++        m_InvSqrtShifted = (uint64_t(m_recInvSqrt2) * m_InvSqrtShifted) >> 32;
++    }
++
++    return t + ReciprocalDivide(interval, m_InvSqrtShifted);
+ }
+ 
+ bool
+@@ -231,7 +260,6 @@ Ptr<QueueDiscItem>
+ CoDelQueueDisc::DoDequeue()
+ {
+     NS_LOG_FUNCTION(this);
+-
+     Ptr<QueueDiscItem> item = GetInternalQueue(0)->Dequeue();
+     if (!item)
+     {
+@@ -290,7 +318,15 @@ CoDelQueueDisc::DoDequeue()
+             while (m_dropping && CoDelTimeAfterEq(now, m_dropNext))
+             {
+                 ++m_count;
+-                m_recInvSqrt = NewtonStep(m_recInvSqrt, m_count);
++                NS_LOG_LOGIC("Entered the loop");
++                if (m_usePp)
++                {
++                    m_recInvSqrt = NewtonStepPp(m_recInvSqrt, m_count);
++                }
++                else
++                {
++                    m_recInvSqrt = NewtonStep(m_recInvSqrt, m_count);
++                }
+                 // It's time for the next drop. Drop the current packet and
+                 // dequeue the next. The dequeue might take us out of dropping
+                 // state. If not, schedule the next drop.
+@@ -305,7 +341,7 @@ CoDelQueueDisc::DoDequeue()
+                                  << item);
+                     NS_LOG_LOGIC("Running ControlLaw for input m_dropNext: " << (double)m_dropNext /
+                                                                                     1000000);
+-                    m_dropNext = ControlLaw(now, Time2CoDel(m_interval), m_recInvSqrt);
++                    m_dropNext = ControlLaw(now, Time2CoDel(m_interval), m_recInvSqrt, m_usePp);
+                     NS_LOG_LOGIC("Scheduled next drop at " << (double)m_dropNext / 1000000);
+                     goto end;
+                 }
+@@ -334,7 +370,11 @@ CoDelQueueDisc::DoDequeue()
+                     /* schedule the next drop */
+                     NS_LOG_LOGIC("Running ControlLaw for input m_dropNext: " << (double)m_dropNext /
+                                                                                     1000000);
+-                    m_dropNext = ControlLaw(m_dropNext, Time2CoDel(m_interval), m_recInvSqrt);
++                    m_dropNext =
++                        ControlLaw(m_dropNext, Time2CoDel(m_interval), m_recInvSqrt, m_usePp);
++                    NS_LOG_LOGIC("ControlLaw count=" << m_count << " recInvSq=" << m_recInvSqrt
++                                                     << " now=" << now
++                                                     << " nextDrop=" << m_dropNext);
+                     NS_LOG_LOGIC("Scheduled next drop at " << (double)m_dropNext / 1000000);
+                 }
+             }
+@@ -379,7 +419,14 @@ CoDelQueueDisc::DoDequeue()
+             if (delta > 1 && CoDelTimeBefore(now - m_dropNext, 16 * Time2CoDel(m_interval)))
+             {
+                 m_count = delta;
+-                m_recInvSqrt = NewtonStep(m_recInvSqrt, m_count);
++                if (m_usePp)
++                {
++                    m_recInvSqrt = NewtonStepPp(m_recInvSqrt, m_count);
++                }
++                else
++                {
++                    m_recInvSqrt = NewtonStep(m_recInvSqrt, m_count);
++                }
+             }
+             else
+             {
+@@ -388,7 +435,9 @@ CoDelQueueDisc::DoDequeue()
+             }
+             m_lastCount = m_count;
+             NS_LOG_LOGIC("Running ControlLaw for input now: " << (double)now);
+-            m_dropNext = ControlLaw(now, Time2CoDel(m_interval), m_recInvSqrt);
++            m_dropNext = ControlLaw(now, Time2CoDel(m_interval), m_recInvSqrt, m_usePp);
++            NS_LOG_LOGIC("ControlLaw count=" << m_count << " recInvSq=" << m_recInvSqrt
++                                             << " now=" << now << " nextDrop=" << m_dropNext);
+             NS_LOG_LOGIC("Scheduled next drop at " << (double)m_dropNext / 1000000 << " now "
+                                                    << (double)now / 1000000);
+         }
+diff --git a/src/traffic-control/model/codel-queue-disc.h b/src/traffic-control/model/codel-queue-disc.h
+index d0b737f17..bc7123ba4 100644
+--- a/src/traffic-control/model/codel-queue-disc.h
++++ b/src/traffic-control/model/codel-queue-disc.h
+@@ -144,7 +144,27 @@ class CoDelQueueDisc : public QueueDisc
+      * @param recInvSqrt reciprocal value of sqrt (count)
+      * @return The new next drop time (in units of CoDel time)
+      */
+-    static uint32_t ControlLaw(uint32_t t, uint32_t interval, uint32_t recInvSqrt);
++    /**
++     * NewtonStep calculation for Codel ++
++     * m_recInvSqrt (new) = (m_recInvSqrt (old) / 4) * (5 - m_count * m_recInvSqrt^4)
++     * @param recInvSqrt reciprocal value of quadroot (count)
++     * @param count count value
++     * @return The new recInvSqrt value
++     */
++    static uint16_t NewtonStepPp(uint16_t recInvSqrt, uint32_t count);
++    /**
++     * @brief Determine the time for next drop
++     * CoDel control law is t + m_interval/sqrt(m_count).
++     * Here, we use m_recInvSqrt calculated by Newton's method in NewtonStepPp() to avoid
++     * both sqrt() and divide operations
++     *
++     * @param t Current next drop time (in units of CoDel time)
++     * @param interval interval (in units of CoDel time)
++     * @param recInvSqrt reciprocal value of quadroot (count^3)
++     * @param m_usePp using CoDel++
++     * @return The new next drop time (in units of CoDel time)
++     */
++    static uint32_t ControlLaw(uint32_t t, uint32_t interval, uint32_t recInvSqrt, bool m_usePp);
+ 
+     /**
+      * @brief Determine whether a packet is OK to be dropped. The packet
+@@ -197,6 +217,7 @@ class CoDelQueueDisc : public QueueDisc
+     void InitializeParams() override;
+ 
+     bool m_useEcn;       //!< True if ECN is used (packets are marked instead of being dropped)
++    bool m_usePp;       //!< True if pp is used (enables CoDel++ (pp stands for ++))
+     bool m_useL4s;       //!< True if L4S is used (ECT1 packets are marked at CE threshold)
+     uint32_t m_minBytes; //!< Minimum bytes in queue to allow a packet drop
+     Time m_interval;     //!< 100 ms sliding minimum time window width
+diff --git a/src/traffic-control/test/codel-queue-disc-test-suite.cc b/src/traffic-control/test/codel-queue-disc-test-suite.cc
+index 7b115e47c..8ea3ecf81 100644
+--- a/src/traffic-control/test/codel-queue-disc-test-suite.cc
++++ b/src/traffic-control/test/codel-queue-disc-test-suite.cc
+@@ -436,7 +436,7 @@ CoDelQueueDiscControlLawTest::DoRun()
+         for (uint16_t recInvSqrt = 0xff; recInvSqrt > 0; recInvSqrt /= 2)
+         {
+             codelTimeVal = queue->Time2CoDel(timeVal);
+-            uint32_t ns3Result = CoDelQueueDisc::ControlLaw(codelTimeVal, interval, recInvSqrt);
++            uint32_t ns3Result = CoDelQueueDisc::ControlLaw(codelTimeVal, interval, recInvSqrt, false);
+             uint32_t linuxResult = _codel_control_law(codelTimeVal, interval, recInvSqrt);
+             NS_TEST_ASSERT_MSG_EQ(ns3Result,
+                                   linuxResult,

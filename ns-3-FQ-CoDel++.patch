@@ -1,0 +1,36 @@
+diff --git a/src/traffic-control/model/fq-codel-queue-disc.cc b/src/traffic-control/model/fq-codel-queue-disc.cc
+index a3f023a3b..931641f8d 100644
+--- a/src/traffic-control/model/fq-codel-queue-disc.cc
++++ b/src/traffic-control/model/fq-codel-queue-disc.cc
+@@ -109,6 +109,11 @@ FqCoDelQueueDisc::GetTypeId()
+                           BooleanValue(true),
+                           MakeBooleanAccessor(&FqCoDelQueueDisc::m_useEcn),
+                           MakeBooleanChecker())
++            .AddAttribute("UsePp",
++                          "True to use pp (Enables CoDel++)",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&FqCoDelQueueDisc::m_usePp),
++                          MakeBooleanChecker())
+             .AddAttribute("Interval",
+                           "The CoDel algorithm interval for each FQCoDel queue",
+                           StringValue("100ms"),
+@@ -266,6 +271,7 @@ FqCoDelQueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
+         if (codel)
+         {
+             codel->SetAttribute("UseEcn", BooleanValue(m_useEcn));
++            codel->SetAttribute("UsePp", BooleanValue(m_usePp));
+             codel->SetAttribute("CeThreshold", TimeValue(m_ceThreshold));
+             codel->SetAttribute("UseL4s", BooleanValue(m_useL4s));
+         }
+diff --git a/src/traffic-control/model/fq-codel-queue-disc.h b/src/traffic-control/model/fq-codel-queue-disc.h
+index 45c39f4a8..079c311b6 100644
+--- a/src/traffic-control/model/fq-codel-queue-disc.h
++++ b/src/traffic-control/model/fq-codel-queue-disc.h
+@@ -148,6 +148,7 @@ class FqCoDelQueueDisc : public QueueDisc
+      */
+     uint32_t FqCoDelDrop();
+ 
++    bool m_usePp; //!< True if pp is used (enables CoDel++ (pp stands for ++))
+     bool m_useEcn; //!< True if ECN is used (packets are marked instead of being dropped)
+     /**
+      * Compute the index of the queue for the flow having the given flowHash,

@@ -1,0 +1,235 @@
+diff --git a/include/uapi/linux/pkt_sched.h b/include/uapi/linux/pkt_sched.h
+index 25a9a47..2e1e4d6 100644
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@ -714,6 +714,7 @@ enum {
+ 	TCA_CODEL_INTERVAL,
+ 	TCA_CODEL_ECN,
+ 	TCA_CODEL_CE_THRESHOLD,
++	TCA_CODEL_PP,
+ 	__TCA_CODEL_MAX
+ };
+ 
+@@ -743,6 +744,7 @@ enum {
+ 	TCA_FQ_CODEL_LIMIT,
+ 	TCA_FQ_CODEL_INTERVAL,
+ 	TCA_FQ_CODEL_ECN,
++	TCA_FQ_CODEL_PP,
+ 	TCA_FQ_CODEL_FLOWS,
+ 	TCA_FQ_CODEL_QUANTUM,
+ 	TCA_FQ_CODEL_CE_THRESHOLD,
+diff --git a/man/man8/tc-codel.8 b/man/man8/tc-codel.8
+index 7bf0866..55fa7b6 100644
+--- a/man/man8/tc-codel.8
++++ b/man/man8/tc-codel.8
+@@ -15,7 +15,9 @@ TIME ] [
+ .B noecn
+ ] [
+ .B ce_threshold
+-TIME ]
++TIME ] [
++.B pp
++]
+ 
+ .SH DESCRIPTION
+ CoDel (pronounced "coddle") is an adaptive "no-knobs" active queue management
+@@ -60,6 +62,9 @@ packets are no longer dropped.
+ 
+ Additional details can be found in the paper cited below.
+ 
++CoDel++ modifies CoDel's control law to better adapt to high-speed congestion
++control algorithms, improving queue delay and throughput trade-off.
++
+ .SH PARAMETERS
+ .SS limit
+ is the hard limit on the real queue size. When this limit is reached, incoming packets
+@@ -92,6 +97,10 @@ sets a threshold above which all packets are marked with ECN Congestion
+ Experienced. This is useful for DCTCP-style congestion control algorithms that
+ require marking at very shallow queueing thresholds.
+ 
++.SS pp
++can be used to enable CoDel++ (pp stands for ++). By default,
++.B pp
++is disabled.
+ 
+ .SH EXAMPLES
+  # tc qdisc add dev eth0 root codel
+@@ -112,6 +121,14 @@ interval 30.0ms ecn
+      count 0 lastcount 0 ldelay 76us drop_next 0us
+      maxpacket 2962 ecn_mark 0 drop_overlimit 0
+ 
++ # tc qdisc add dev eth0 root codel pp
++ # tc -s qdisc show
++   qdisc codel 8008: dev eth0 root refcnt 2 limit 1000p target 5ms
++interval 100ms pp
++    Sent 40520 bytes 57 pkt (dropped 0, overlimits 0 requeues 0)
++    backlog 0b 0p requeues
++     count 0 lastcount 0 ldelay 0us drop_next 0us
++     maxpacket 0 ecn_mark 0 drop_overlimit 0
+ 
+ .SH SEE ALSO
+ .BR tc (8),
+diff --git a/man/man8/tc-fq_codel.8 b/man/man8/tc-fq_codel.8
+index 7859063..23772d7 100644
+--- a/man/man8/tc-fq_codel.8
++++ b/man/man8/tc-fq_codel.8
+@@ -18,6 +18,8 @@ BYTES ] [
+ |
+ .B noecn
+ ] [
++.B pp
++] [
+ .B ce_threshold
+ TIME ] [
+ .B ce_threshold_selector
+@@ -108,6 +110,11 @@ or
+ .B memory_limit
+ is exceeded. Default value is 64.
+ 
++.SS pp
++can be used to enable CoDel++ (pp stands for ++). By default,
++.B pp
++is disabled.
++
+ .SH EXAMPLES
+ #tc qdisc add   dev eth0 root fq_codel
+ .br
+@@ -131,6 +138,17 @@ target 3.0ms interval 40.0ms
+   maxpacket 65226 drop_overlimit 0 new_flow_count 73 ecn_mark 0
+   new_flows_len 1 old_flows_len 3
+ 
++#tc qdisc add dev eth0 root fq_codel pp
++.br
++#tc -s qdisc show
++.br
++qdisc fq_codel 8001: dev eth0 root refcnt 2 limit 10240p flows 1514
++ target 5ms ce_threshold 64us interval 100ms ecn pp drop_batch 33554432
++   Sent 19056 bytes 35 pkt (dropped 0, overlimits 0 requeues 0)
++   backlog 0b 0p requeues 0
++    maxpacket 0 drop_overlimit 0 new_flow_count 0 ecn_mark 0
++    new_flows_len 0 old_flows_len 0
++
+ 
+ .SH SEE ALSO
+ .BR tc (8),
+diff --git a/tc/q_codel.c b/tc/q_codel.c
+index 15029b4..0e727b9 100644
+--- a/tc/q_codel.c
++++ b/tc/q_codel.c
+@@ -25,7 +25,8 @@ static void explain(void)
+ 	fprintf(stderr,
+ 		"Usage: ... codel [ limit PACKETS ] [ target TIME ]\n"
+ 		"		 [ interval TIME ] [ ecn | noecn ]\n"
+-		"		 [ ce_threshold TIME ]\n");
++		"		 [ ce_threshold TIME ] [ pp ]\n");
++
+ }
+ 
+ static int codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv,
+@@ -36,6 +37,7 @@ static int codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv,
+ 	unsigned int interval = 0;
+ 	unsigned int ce_threshold = ~0U;
+ 	int ecn = -1;
++	int pp = 0;
+ 	struct rtattr *tail;
+ 
+ 	while (argc > 0) {
+@@ -67,6 +69,8 @@ static int codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv,
+ 			ecn = 1;
+ 		} else if (strcmp(*argv, "noecn") == 0) {
+ 			ecn = 0;
++		} else if (strcmp(*argv, "pp") == 0) {
++			pp = 1;
+ 		} else if (strcmp(*argv, "help") == 0) {
+ 			explain();
+ 			return -1;
+@@ -90,6 +94,8 @@ static int codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv,
+ 	if (ce_threshold != ~0U)
+ 		addattr_l(n, 1024, TCA_CODEL_CE_THRESHOLD,
+ 			  &ce_threshold, sizeof(ce_threshold));
++	if(pp != -1)
++		addattr_l(n, 1024, TCA_CODEL_PP, &pp, sizeof(pp));
+ 
+ 	addattr_nest_end(n, tail);
+ 	return 0;
+@@ -102,6 +108,7 @@ static int codel_print_opt(const struct qdisc_util *qu, FILE *f, struct rtattr *
+ 	unsigned int interval;
+ 	unsigned int target;
+ 	unsigned int ecn;
++	unsigned int pp;
+ 	unsigned int ce_threshold;
+ 
+ 	SPRINT_BUF(b1);
+@@ -143,6 +150,12 @@ static int codel_print_opt(const struct qdisc_util *qu, FILE *f, struct rtattr *
+ 		if (ecn)
+ 			print_bool(PRINT_ANY, "ecn", "ecn ", true);
+ 	}
++	if (tb[TCA_CODEL_PP] &&
++	    RTA_PAYLOAD(tb[TCA_CODEL_PP]) >= sizeof(__u32)) {
++		pp = rta_getattr_u32(tb[TCA_CODEL_PP]);
++		if (pp)
++			print_bool(PRINT_ANY, "pp", "pp ", true);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/tc/q_fq_codel.c b/tc/q_fq_codel.c
+index a619d2b..371c12f 100644
+--- a/tc/q_fq_codel.c
++++ b/tc/q_fq_codel.c
+@@ -24,7 +24,7 @@ static void explain(void)
+ 					"[ memory_limit BYTES ]\n"
+ 					"[ target TIME ] [ interval TIME ]\n"
+ 					"[ quantum BYTES ] [ [no]ecn ]\n"
+-					"[ ce_threshold TIME ]\n"
++					"[ pp ] [ ce_threshold TIME ]\n"
+ 					"[ ce_threshold_selector VALUE/MASK ]\n"
+ 					"[ drop_batch SIZE ]\n");
+ }
+@@ -43,6 +43,7 @@ static int fq_codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv
+ 	__u8 ce_threshold_mask = 0;
+ 	__u8 ce_threshold_selector = 0xFF;
+ 	int ecn = -1;
++	int pp = 0;
+ 	struct rtattr *tail;
+ 
+ 	while (argc > 0) {
+@@ -116,6 +117,8 @@ static int fq_codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv
+ 			ecn = 1;
+ 		} else if (strcmp(*argv, "noecn") == 0) {
+ 			ecn = 0;
++		} else if (strcmp(*argv, "pp") == 0) {
++			pp = 1;
+ 		} else if (strcmp(*argv, "help") == 0) {
+ 			explain();
+ 			return -1;
+@@ -140,6 +143,8 @@ static int fq_codel_parse_opt(const struct qdisc_util *qu, int argc, char **argv
+ 		addattr_l(n, 1024, TCA_FQ_CODEL_TARGET, &target, sizeof(target));
+ 	if (ecn != -1)
+ 		addattr_l(n, 1024, TCA_FQ_CODEL_ECN, &ecn, sizeof(ecn));
++	if(pp != -1)
++		addattr_l(n, 1024, TCA_FQ_CODEL_PP, &pp, sizeof(pp));
+ 	if (ce_threshold != ~0U)
+ 		addattr_l(n, 1024, TCA_FQ_CODEL_CE_THRESHOLD,
+ 			  &ce_threshold, sizeof(ce_threshold));
+@@ -165,6 +170,7 @@ static int fq_codel_print_opt(const struct qdisc_util *qu, FILE *f, struct rtatt
+ 	unsigned int interval;
+ 	unsigned int target;
+ 	unsigned int ecn;
++	unsigned int pp;
+ 	unsigned int quantum;
+ 	unsigned int ce_threshold;
+ 	__u8 ce_threshold_selector = 0;
+@@ -240,6 +246,12 @@ static int fq_codel_print_opt(const struct qdisc_util *qu, FILE *f, struct rtatt
+ 		if (ecn)
+ 			print_bool(PRINT_ANY, "ecn", "ecn ", true);
+ 	}
++	if (tb[TCA_FQ_CODEL_PP] &&
++	    RTA_PAYLOAD(tb[TCA_FQ_CODEL_PP]) >= sizeof(__u32)) {
++		pp = rta_getattr_u32(tb[TCA_FQ_CODEL_PP]);
++		if (pp)
++			print_bool(PRINT_ANY, "pp", "pp ", true);
++	}
+ 	if (tb[TCA_FQ_CODEL_DROP_BATCH_SIZE] &&
+ 	    RTA_PAYLOAD(tb[TCA_FQ_CODEL_DROP_BATCH_SIZE]) >= sizeof(__u32)) {
+ 		drop_batch = rta_getattr_u32(tb[TCA_FQ_CODEL_DROP_BATCH_SIZE]);

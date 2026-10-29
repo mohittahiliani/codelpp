@@ -1,0 +1,209 @@
+diff --git a/include/net/codel.h b/include/net/codel.h
+index aa80f7448..e660cbdc3 100644
+--- a/include/net/codel.h
++++ b/include/net/codel.h
+@@ -110,6 +110,7 @@ struct codel_params {
+ 	codel_time_t	interval;
+ 	u32		mtu;
+ 	bool		ecn;
++	bool		pp;
+ 	u8		ce_threshold_selector;
+ 	u8		ce_threshold_mask;
+ };
+@@ -131,6 +132,7 @@ struct codel_vars {
+ 	u32		lastcount;
+ 	bool		dropping;
+ 	u16		rec_inv_sqrt;
++	u16 	rec_inv_quadrt_cube;
+ 	codel_time_t	first_above_time;
+ 	codel_time_t	drop_next;
+ 	codel_time_t	ldelay;
+diff --git a/include/net/codel_impl.h b/include/net/codel_impl.h
+index 78a27ac73..7f4085e45 100644
+--- a/include/net/codel_impl.h
++++ b/include/net/codel_impl.h
+@@ -89,6 +89,30 @@ static void codel_Newton_step(struct codel_vars *vars)
+ 	vars->rec_inv_sqrt = val >> REC_INV_SQRT_SHIFT;
+ }
+ 
++/*
++ * new_invquadrt = (invquadrt / 4) * (5 - count * invquadrt^4)
++ * 
++ * invquadrt is stored in rec_inv_sqrt variable
++ */
++static void codelpp_Newton_step(struct codel_vars *vars)
++{
++	u32 invquadrt = ((u32)vars->rec_inv_sqrt) << REC_INV_SQRT_SHIFT;
++	u32 invquadrt2 = ((u64)invquadrt * invquadrt) >> 32;
++	u32 invquadrt4 = ((u64)invquadrt2 * invquadrt2) >> 32;
++	u64 val = (5LL << 32) - ((u64)vars->count * invquadrt4);
++
++	val >>= 3; /* avoid overflow in following multiply */
++	val = (val * invquadrt) >> (32 - 3 + 2);
++
++	vars->rec_inv_sqrt = (u16)(val >> REC_INV_SQRT_SHIFT);
++
++	/* store cube of inverse quad root*/
++	invquadrt = (u32) val;
++	u32 invquadrtsq = ((u64)(invquadrt) * invquadrt) >> 32;
++	u32 invquadrtcub = ((u64)(invquadrtsq) * invquadrt) >> 32;
++	vars->rec_inv_quadrt_cube = invquadrtcub >> REC_INV_SQRT_SHIFT;
++}
++
+ /*
+  * CoDel control_law is t + interval/sqrt(count)
+  * We maintain in rec_inv_sqrt the reciprocal value of sqrt(count) to avoid
+@@ -96,9 +120,9 @@ static void codel_Newton_step(struct codel_vars *vars)
+  */
+ static codel_time_t codel_control_law(codel_time_t t,
+ 				      codel_time_t interval,
+-				      u32 rec_inv_sqrt)
++				      u32 rec_inv_root)
+ {
+-	return t + reciprocal_scale(interval, rec_inv_sqrt << REC_INV_SQRT_SHIFT);
++	return t + reciprocal_scale(interval, rec_inv_root << REC_INV_SQRT_SHIFT);
+ }
+ 
+ static bool codel_should_drop(const struct sk_buff *skb,
+@@ -182,13 +206,19 @@ static struct sk_buff *codel_dequeue(void *ctx,
+ 				vars->count++; /* dont care of possible wrap
+ 						* since there is no more divide
+ 						*/
+-				codel_Newton_step(vars);
++				if(params->pp){
++					codelpp_Newton_step(vars);
++				} else{
++					codel_Newton_step(vars);
++				}
+ 				if (params->ecn && INET_ECN_set_ce(skb)) {
+ 					stats->ecn_mark++;
+ 					vars->drop_next =
+ 						codel_control_law(vars->drop_next,
+ 								  params->interval,
+-								  vars->rec_inv_sqrt);
++								  params->pp?
++								  	vars->rec_inv_quadrt_cube: 
++									vars->rec_inv_sqrt);
+ 					goto end;
+ 				}
+ 				stats->drop_len += skb_len_func(skb);
+@@ -207,7 +237,9 @@ static struct sk_buff *codel_dequeue(void *ctx,
+ 					vars->drop_next =
+ 						codel_control_law(vars->drop_next,
+ 								  params->interval,
+-								  vars->rec_inv_sqrt);
++								  params->pp?
++								  	vars->rec_inv_quadrt_cube:
++									vars->rec_inv_sqrt);
+ 				}
+ 			}
+ 		}
+@@ -240,14 +272,20 @@ static struct sk_buff *codel_dequeue(void *ctx,
+ 			 * is not very precise :
+ 			 * Next Newton steps will correct it quadratically.
+ 			 */
+-			codel_Newton_step(vars);
++			if(params->pp){
++				codelpp_Newton_step(vars);
++			} else{
++				codel_Newton_step(vars);
++			}
+ 		} else {
+ 			vars->count = 1;
+ 			vars->rec_inv_sqrt = ~0U >> REC_INV_SQRT_SHIFT;
+ 		}
+ 		vars->lastcount = vars->count;
+ 		vars->drop_next = codel_control_law(now, params->interval,
+-						    vars->rec_inv_sqrt);
++						    params->pp?
++								vars->rec_inv_quadrt_cube:
++								vars->rec_inv_sqrt);
+ 	}
+ end:
+ 	if (skb && codel_time_after(vars->ldelay, params->ce_threshold)) {
+diff --git a/include/uapi/linux/pkt_sched.h b/include/uapi/linux/pkt_sched.h
+index c2da76e78..bb8ef5c66 100644
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@ -714,6 +714,7 @@ enum {
+ 	TCA_CODEL_INTERVAL,
+ 	TCA_CODEL_ECN,
+ 	TCA_CODEL_CE_THRESHOLD,
++	TCA_CODEL_PP,
+ 	__TCA_CODEL_MAX
+ };
+ 
+@@ -743,6 +744,7 @@ enum {
+ 	TCA_FQ_CODEL_LIMIT,
+ 	TCA_FQ_CODEL_INTERVAL,
+ 	TCA_FQ_CODEL_ECN,
++	TCA_FQ_CODEL_PP,
+ 	TCA_FQ_CODEL_FLOWS,
+ 	TCA_FQ_CODEL_QUANTUM,
+ 	TCA_FQ_CODEL_CE_THRESHOLD,
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index fa0314679..50d6e7d53 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -96,6 +96,7 @@ static const struct nla_policy codel_policy[TCA_CODEL_MAX + 1] = {
+ 	[TCA_CODEL_INTERVAL]	= { .type = NLA_U32 },
+ 	[TCA_CODEL_ECN]		= { .type = NLA_U32 },
+ 	[TCA_CODEL_CE_THRESHOLD]= { .type = NLA_U32 },
++	[TCA_CODEL_PP] = {.type = NLA_U32 },
+ };
+ 
+ static int codel_change(struct Qdisc *sch, struct nlattr *opt,
+@@ -141,6 +142,10 @@ static int codel_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (tb[TCA_CODEL_ECN])
+ 		WRITE_ONCE(q->params.ecn,
+ 			   !!nla_get_u32(tb[TCA_CODEL_ECN]));
++	
++	if (tb[TCA_CODEL_PP])
++		WRITE_ONCE(q->params.pp,
++				!!nla_get_u32(tb[TCA_CODEL_PP]));
+ 
+ 	while (sch->q.qlen > sch->limit) {
+ 		struct sk_buff *skb = qdisc_dequeue_internal(sch, true);
+@@ -202,7 +207,9 @@ static int codel_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	    nla_put_u32(skb, TCA_CODEL_INTERVAL,
+ 			codel_time_to_us(READ_ONCE(q->params.interval))) ||
+ 	    nla_put_u32(skb, TCA_CODEL_ECN,
+-			READ_ONCE(q->params.ecn)))
++			READ_ONCE(q->params.ecn)) ||
++	    nla_put_u32(skb, TCA_CODEL_PP,
++			READ_ONCE(q->params.pp)))
+ 		goto nla_put_failure;
+ 	ce_threshold = READ_ONCE(q->params.ce_threshold);
+ 	if (ce_threshold != CODEL_DISABLED_THRESHOLD &&
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index a14142392..7d444e196 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -354,6 +354,7 @@ static const struct nla_policy fq_codel_policy[TCA_FQ_CODEL_MAX + 1] = {
+ 	[TCA_FQ_CODEL_LIMIT]	= { .type = NLA_U32 },
+ 	[TCA_FQ_CODEL_INTERVAL]	= { .type = NLA_U32 },
+ 	[TCA_FQ_CODEL_ECN]	= { .type = NLA_U32 },
++	[TCA_FQ_CODEL_PP] = {.type = NLA_U32 },
+ 	[TCA_FQ_CODEL_FLOWS]	= { .type = NLA_U32 },
+ 	[TCA_FQ_CODEL_QUANTUM]	= { .type = NLA_U32 },
+ 	[TCA_FQ_CODEL_CE_THRESHOLD] = { .type = NLA_U32 },
+@@ -429,6 +430,10 @@ static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt,
+ 		WRITE_ONCE(q->cparams.ecn,
+ 			   !!nla_get_u32(tb[TCA_FQ_CODEL_ECN]));
+ 
++	if (tb[TCA_FQ_CODEL_PP])
++		WRITE_ONCE(q->cparams.pp,
++			   !!nla_get_u32(tb[TCA_FQ_CODEL_PP]));
++
+ 	if (quantum)
+ 		WRITE_ONCE(q->quantum, quantum);
+ 
+@@ -547,6 +552,8 @@ static int fq_codel_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 			codel_time_to_us(READ_ONCE(q->cparams.interval))) ||
+ 	    nla_put_u32(skb, TCA_FQ_CODEL_ECN,
+ 			READ_ONCE(q->cparams.ecn)) ||
++	    nla_put_u32(skb, TCA_FQ_CODEL_PP,
++			READ_ONCE(q->cparams.pp)) ||
+ 	    nla_put_u32(skb, TCA_FQ_CODEL_QUANTUM,
+ 			READ_ONCE(q->quantum)) ||
+ 	    nla_put_u32(skb, TCA_FQ_CODEL_DROP_BATCH_SIZE,
